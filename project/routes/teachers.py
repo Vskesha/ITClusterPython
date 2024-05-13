@@ -1,11 +1,15 @@
 from flask_restx import Resource, Namespace, abort
 
 from project.extensions import db
-from project.models import Teacher, Position, University, Role
+from project.models import Teacher, Position, University, Role, Roles
+from project.schemas.authorization import authorizations
 from project.schemas.service_info import serviced_teacher_model
 from project.schemas.teachers import teacher_model, teacher_query_model
+from project.validators import allowed_roles
 
-teachers_ns = Namespace(name="teachers", description="info about teachers")
+teachers_ns = Namespace(
+    name="teachers", description="info about teachers", authorizations=authorizations
+)
 
 
 def get_teacher_or_404(id):
@@ -22,11 +26,8 @@ def get_teacher_response():
 
     return {
         "content": teachers,
-        "service_info": {
-            "position": positions,
-            "university": university
-        },
-        "totalElements": len(teachers)
+        "service_info": {"position": positions, "university": university},
+        "totalElements": len(teachers),
     }
 
 
@@ -41,6 +42,8 @@ class TeachersList(Resource):
 
     @teachers_ns.expect(teacher_query_model)
     @teachers_ns.marshal_with(serviced_teacher_model)
+    @teachers_ns.doc(security="jsonWebToken")
+    @allowed_roles([Roles.ADMIN, Roles.CONTENT_MANAGER])
     def post(self):
         """Adds a new teacher"""
         teacher = Teacher()
@@ -51,7 +54,7 @@ class TeachersList(Resource):
                 setattr(teacher, key, value)
             elif key in nested_ids:
                 setattr(teacher, key + "_id", value.get("id"))
-        teacher.role_id = Role.query.filter_by(name="teacher").first().id
+        teacher.role_id = Role.query.filter_by(name=Roles.TEACHER).first().id
         db.session.add(teacher)
         db.session.commit()
         return get_teacher_response()
@@ -70,6 +73,8 @@ class TeachersDetail(Resource):
 
     @teachers_ns.expect(teacher_query_model, validate=False)
     @teachers_ns.marshal_with(serviced_teacher_model)
+    @teachers_ns.doc(security="jsonWebToken")
+    @allowed_roles([Roles.ADMIN, Roles.CONTENT_MANAGER])
     def patch(self, id):
         """Update the teacher with a given id"""
         teacher = get_teacher_or_404(id)
@@ -84,6 +89,8 @@ class TeachersDetail(Resource):
         return get_teacher_response()
 
     @teachers_ns.marshal_with(serviced_teacher_model)
+    @teachers_ns.doc(security="jsonWebToken")
+    @allowed_roles([Roles.ADMIN, Roles.CONTENT_MANAGER])
     def delete(self, id):
         """Delete the teacher with given id"""
         teacher = get_teacher_or_404(id)

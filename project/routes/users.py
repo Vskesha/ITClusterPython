@@ -1,14 +1,20 @@
+import random
 from datetime import datetime, timedelta
-from os import environ
+from string import ascii_letters, digits, punctuation
+from typing import List, Optional
 
 import jwt
-from dotenv import load_dotenv
-
-from flask import request, url_for, render_template
+from flask import (
+    request,
+    url_for,
+    render_template,
+    current_app,
+    redirect,
+    make_response,
+)
 from flask_jwt_extended import (
     create_access_token,
     create_refresh_token,
-    get_jwt,
     get_jwt_identity,
     jwt_required,
 )
@@ -18,22 +24,110 @@ from jwt import ExpiredSignatureError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from project.extensions import db, mail
+from project.schemas.authorization import authorizations
+from project.schemas.service_info import service_info_for_teacher
 from project.schemas.users import (
     user_model,
     user_login_parser,
     user_login_response,
     user_register_parser,
     user_change_password_parser,
-    email_schema,
-    password_schema,
+    expert_register_parser,
+    teacher_register_parser,
+    email_parser,
+    token_parser,
+    teacher_register_request_model,
 )
-from project.models import User, Teacher, Role
+from project.models import User, Teacher, Role, Roles, Specialist, Position, University
 
-user_ns = Namespace(name="user", description="User related endpoints")
+user_ns = Namespace(
+    name="user", description="User related endpoints", authorizations=authorizations
+)
 
-load_dotenv()
-KEY = environ.get("JWT_SECRET_KEY")
-ALGORITHM = environ.get("JWT_ALGORITHM")
+
+def create_expert(args):
+    """create new expert in database"""
+    email = args.get("email")
+
+    if Specialist.query.filter_by(email=email).first():
+        abort(400, f"Expert with email '{email}' already exists")
+
+    name = " ".join(
+        [
+            args.get("first_name"),
+            args.get("parent_name") or "",
+            args.get("last_name"),
+        ]
+    ).replace("  ", " ")
+
+    expert = Specialist(
+        company=args.get("company"),
+        name=name,
+        position=args.get("position"),
+        email=args.get("email"),
+        phone=args.get("phone") or "",
+        professional_field=args.get("professional_field"),
+        discipline_type=args.get("discipline_type"),
+        experience=args.get("experience"),
+        url_cv=args.get("url_cv") or "",
+        role_id=Role.query.filter_by(name=Roles.SPECIALIST).first().id,
+    )
+
+    return expert
+
+
+def create_teacher(args):
+    """create new teacher in database"""
+    email = args.get("email")
+
+    if Teacher.query.filter_by(email=email).first():
+        return None
+
+    name = " ".join(
+        [
+            args.get("first_name"),
+            args.get("parent_name") or "",
+            args.get("last_name"),
+        ]
+    ).replace("  ", " ")
+
+    teacher = Teacher(
+        name=name,
+        position_id=args.get("position_id"),
+        email=args.get("email"),
+        department_id=args.get("department_id"),
+        comments=args.get("comments") or "",
+        degree_level=args.get("degree_level") or "",
+        role_id=Role.query.filter_by(name=Roles.TEACHER).first().id,
+    )
+
+    return teacher
+
+
+def create_user(args, role: Roles):
+    """create new user in database and send email with confirmation token"""
+
+    email = args.get("email")
+
+    if User.query.filter_by(email=email).first():
+        abort(400, f"User with email '{email}' already exists")
+
+    user = User(
+        email=email,
+        password_hash=generate_password_hash(args.get("password")),
+        first_name=args.get("first_name"),
+        last_name=args.get("last_name"),
+        parent_name=args.get("parent_name") or "",
+        phone=args.get("phone") or "",
+        role_id=Role.query.filter_by(name=role).first().id,
+    )
+
+    return user
+
+
+def generate_password(length=12):
+    characters = ascii_letters + digits + punctuation
+    return "".join(random.choice(characters) for i in range(length))
 
 
 class SecurityUtils:
@@ -41,71 +135,127 @@ class SecurityUtils:
     def encrypt_data(data):
         expiration_time = datetime.utcnow() + timedelta(hours=24)
         data_with_exp = {**data, "exp": expiration_time}
-        encrypted_token = jwt.encode(data_with_exp, KEY, algorithm=ALGORITHM)
+        encrypted_token = jwt.encode(
+            data_with_exp,
+            current_app.config["JWT_SECRET_KEY"],
+            algorithm=current_app.config["JWT_ALGORITHM"],
+        )
         return encrypted_token
 
     @staticmethod
     def decrypt_data(data):
         decrypted_data = jwt.decode(
             data,
-            KEY,
-            algorithms=[ALGORITHM],
+            current_app.config["JWT_SECRET_KEY"],
+            algorithms=[current_app.config["JWT_ALGORITHM"]],
         )
         return decrypted_data
 
     @staticmethod
-    def send_mail(user, subject, template):
-        msg = Message(
-            subject=subject,
-            sender=environ.get("MAIL_USERNAME"),
-            recipients=[user.email],
-            html=template,
+    def send_confirm_token(user, front_url):
+        token = SecurityUtils.encrypt_data(
+            {"email": user.email, "front_url": front_url}
         )
-        mail.send(msg)
 
-
-@user_ns.route("/register")
-class Register(Resource):
-
-    @staticmethod
-    def send_confirm_token(user):
-        token = SecurityUtils.encrypt_data({"email": user.email})
         url_confirm = url_for("user_confirm_mail", token=token, _external=True)
         confirm_mail = render_template(
             "confirm_email.html", confirm_url=url_confirm, user=user
         )
         SecurityUtils.send_mail(
-            user, subject="It Cluster - Confirm mail", template=confirm_mail
+            subject="Education UA - Confirm email",
+            template=confirm_mail,
+            recipients=[user.email],
         )
+
+    @staticmethod
+    def send_mail(subject: str, template, recipients: List) -> None:
+
+        msg = Message(
+            subject=subject,
+            recipients=recipients,
+            html=template,
+        )
+
+        mail.send(msg)
+
+
+@user_ns.route("/register/user")
+class RegisterUser(Resource):
 
     @user_ns.expect(user_register_parser)
     @user_ns.marshal_with(user_model)
     def post(self):
+        """Register new user"""
         args = user_register_parser.parse_args()
-        email = args.get("email")
+        user = create_user(args, Roles.USER)
 
-        if User.query.filter_by(email=email).first():
-            abort(400, f"User with email '{email}' already exists")
+        SecurityUtils.send_confirm_token(user, request.headers.get("Origin"))
 
-        user = User(
-            email=email,
-            password_hash=generate_password_hash(args.get("password")),
-            first_name=args.get("first_name"),
-            last_name=args.get("last_name"),
-            parent_name=args.get("parent_name") or "",
-            phone=args.get("phone") or "",
-            role_id=Role.query.filter_by(name="user").first().id,
-        )
         db.session.add(user)
         db.session.commit()
 
-        self.send_confirm_token(user)
         return user, 201
+
+
+@user_ns.route("/register/expert")
+class RegisterExpert(Resource):
+
+    @user_ns.expect(expert_register_parser)
+    @user_ns.marshal_with(user_model)
+    def post(self):
+        """Register new expert"""
+        args = expert_register_parser.parse_args()
+        user_expert = create_user(args, Roles.SPECIALIST)
+        expert = create_expert(args)
+
+        SecurityUtils.send_confirm_token(user_expert, request.headers.get("Origin"))
+
+        db.session.add(user_expert)
+        db.session.add(expert)
+        db.session.commit()
+
+        return user_expert, 201
+
+
+@user_ns.route("/register/teacher")
+class RegisterTeacher(Resource):
+
+    @user_ns.marshal_with(service_info_for_teacher, envelope="service_info")
+    def get(self):
+        """Service info for registering a teacher"""
+        positions = Position.query.all()
+        university = University.query.all()
+        return {"position": positions, "university": university}
+
+    @user_ns.expect(teacher_register_parser)
+    @user_ns.marshal_with(user_model)
+    def post(self):
+        """Register new teacher"""
+        args = teacher_register_parser.parse_args()
+        user_teacher = create_user(args, Roles.TEACHER)
+        teacher = create_teacher(args)
+
+        SecurityUtils.send_confirm_token(user_teacher, request.headers.get("Origin"))
+
+        db.session.add(user_teacher)
+        if teacher:
+            db.session.add(teacher)
+        db.session.commit()
+
+        return user_teacher, 201
 
 
 @user_ns.route("/login")
 class Login(Resource):
 
+    @user_ns.response(
+        401,
+        "One of: \n"
+        "'User with email <email> does not exist'\n"
+        "'Incorrect password'\n"
+        "'Email <email> is not confirmed. Please check your email'\n"
+        "'User with email <email> is banned'",
+    )
     @user_ns.expect(user_login_parser)
     @user_ns.marshal_with(user_login_response)
     def post(self):
@@ -117,111 +267,156 @@ class Login(Resource):
             abort(401, f"User with email '{email}' does not exist")
         if not check_password_hash(user.password_hash, password):
             abort(401, "Incorrect password")
-
-        # TODO: uncomment checking for the email being confirmed
-        # if not user.email_confirmed:
-        #     abort(401, f"Email '{email}' is not confirmed. Please check your email.")
+        if not user.email_confirmed:
+            abort(401, f"Email '{email}' is not confirmed. Please check your email")
+        if not user.active_status:
+            abort(401, f"User with email '{email}' is banned")
 
         user_role = user.role.name
 
-        if user_role == "user":
-            if Teacher.query.filter_by(email=email).first():
-                user.role = Role.query.filter_by(name="teacher").first()
-                db.session.commit()
-                user_role = "teacher"
-
-            # TODO: add check for user role if it's email is in specialist table
-
-        claims = {"role": user_role}
-        return {
-            "access_token": create_access_token(
-                identity=user.email, additional_claims=claims
+        response = {
+            "access_token": "Bearer "
+            + create_access_token(
+                identity=email,
+                additional_claims={"role": user_role, "tokenType": "access"},
             ),
-            "refresh_token": create_refresh_token(
-                identity=user.email, additional_claims=claims
+            "refresh_token": "Bearer "
+            + create_refresh_token(
+                identity=email,
+                additional_claims={"role": user_role, "tokenType": "refresh"},
             ),
             "role": user_role,
+            "id": user.id,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "parent_name": user.parent_name,
+            "email": user.email,
+            "phone": user.phone,
+            "verified": user.email_confirmed,
         }
+
+        if user_role == Roles.TEACHER:
+            teacher = Teacher.query.filter_by(email=email).first()
+            response["id"] = teacher.id
+            response["verified"] = teacher.verified
+        elif user_role == Roles.SPECIALIST:
+            expert = Specialist.query.filter_by(email=email).first()
+            response["id"] = expert.id
+            response["verified"] = expert.verified
+
+        return response
 
 
 @user_ns.route("/confirm_mail/<string:token>")
 class ConfirmMail(Resource):
-    @user_ns.doc(
-        description="Confirm Mail",
-        responses={
-            201: "Success confirm mail",
-            401: "The link has expired",
-            404: "Link not valid",
-        },
-    )
+    @user_ns.doc(description="Confirm Mail")
     def get(self, token: str):
 
         try:
             decrypted_data = SecurityUtils.decrypt_data(token)
         except ExpiredSignatureError:
-            return "The link has expired", 401
+            return abort(401, "The link has expired")
 
-        email = decrypted_data["email"]
+        email = decrypted_data.get("email")
         user = User.query.filter_by(email=email).first()
-        if user:
-            user.email_confirmed = True
-            db.session.commit()
-            return "Success confirm mail", 201
-        return f"User with {email} is not registered", 404
+        if not user:
+            return abort(404, f"User with {email} is not registered")
+
+        user.email_confirmed = True
+        db.session.commit()
+
+        front_url = decrypted_data.get("front_url")
+        if front_url:
+            return redirect(front_url + "/auth")
+
+        return "Success confirm mail", 201
 
 
-@user_ns.route("/reset_password/")
+@user_ns.route("/resend-confirm-email")
+class ResendConfirmEmail(Resource):
+    @user_ns.expect(email_parser)
+    @user_ns.doc(
+        responses={
+            201: "The email was sent successfully",
+            400: "User with {email} is already confirmed",
+            404: "User with {email} is not registered",
+        }
+    )
+    def post(self):
+        """Resend confirmation email"""
+        args = email_parser.parse_args()
+        email = args.get("email")
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            return abort(404, f"User with {email} is not registered")
+        if user.email_confirmed:
+            return abort(400, f"User with {email} is already confirmed")
+
+        SecurityUtils.send_confirm_token(user, request.headers.get("Origin"))
+
+        return {"message": "The email was sent successfully"}, 201
+
+
+@user_ns.route("/reset_password")
 class ResetPassword(Resource):
 
     @user_ns.doc(
-        description="When client recover your password, an email is sent with the link",
+        description="When client resets his password, an email is sent with the link",
         responses={
-            201: "The email was sent successfully",
-            401: "Send correct mail",
+            201: "The email with instructions was sent successfully",
             404: "User with email '{email}' does not exist",
         },
     )
-    @user_ns.expect(email_schema)
+    @user_ns.expect(email_parser)
     def post(self):
-        data = request.json
-
-        email = data.get("email")
-        if not email:
-            abort(401, "Send correct mail")
-
+        args = email_parser.parse_args()
+        email = args.get("email")
         user = User.query.filter_by(email=email).first()
         if not user:
             abort(404, f"User with email '{email}' does not exist")
 
-        data_to_encrypt = {"user_id": user.id, "email": user.email}
-        encrypted_data = SecurityUtils.encrypt_data(data_to_encrypt)
-        link = url_for("user_reset_password", token=encrypted_data, _external=True)
-        subject_mail = "It Cluster - Reset Password"
-        confirm_mail = render_template("reset_password.html", url=link, user=user)
-        SecurityUtils.send_mail(user, subject=subject_mail, template=confirm_mail)
-        return {"message": "The email was sent successfully"}, 201
+        data_to_encrypt = {
+            "front_url": request.headers.get("Origin"),
+            "email": email,
+        }
+        token = SecurityUtils.encrypt_data(data_to_encrypt)
 
+        reset_url = url_for("user_reset_password", token=token, _external=True)
+        subject = "Education UA - Reset Password"
+        body = render_template("reset_password.html", reset_url=reset_url, user=user)
+        SecurityUtils.send_mail(subject=subject, template=body, recipients=[user.email])
 
-@user_ns.route("/reset_password/<string:token>")
-class ResetPasswordPatch(Resource):
+        return {"message": "The email with instructions was sent successfully"}, 201
 
-    @staticmethod
     @user_ns.doc(
-        description="When a token and password are transferred, the password of the user with this token is changed.",
-        responses={201: "Done", 404: "Password or user not found"},
+        description="Send email with new password",
+        responses={
+            200: "Новий пароль було відправлено на {email}",
+            404: "User with email '{email}' does not exist",
+        },
     )
-    @user_ns.expect(password_schema)
-    def patch(token: str):
-        data = request.json
+    @user_ns.expect(token_parser)
+    def get(self):
+        args = token_parser.parse_args()
+        token = args.get("token")
         decrypted_data = SecurityUtils.decrypt_data(token)
-        user_id, email = decrypted_data.values()
+        email = decrypted_data.get("email")
         user = User.query.filter_by(email=email).first()
-        password = data.get("password")
-        if user and password:
-            user.password_hash = generate_password_hash(password)
-            db.session.commit()
-            return "Done", 201
-        return {"message": "Password or user not found"}, 404
+        if not user:
+            return abort(404, f"User with email '{email}' does not exist")
+
+        password = generate_password()
+        user.password_hash = generate_password_hash(password)
+        db.session.commit()
+
+        front_url = decrypted_data.get("front_url") + "/auth"
+        subject = "Education UA - New Password"
+        body = render_template(
+            "new_password.html", front_url=front_url, user=user, password=password
+        )
+        SecurityUtils.send_mail(subject=subject, template=body, recipients=[user.email])
+
+        return make_response(render_template("new_password_page.html", user=user), 200)
 
 
 @user_ns.route("/refresh")
@@ -233,18 +428,40 @@ class Refresh(Resource):
     @jwt_required(refresh=True)
     @user_ns.marshal_with(user_login_response)
     def post(self):
-        identity = get_jwt_identity()
-        user_role = get_jwt().get("role")
-        claims = {"role": user_role}
-        return {
-            "access_token": create_access_token(
-                identity=identity, additional_claims=claims
+        email = get_jwt_identity()
+        user = User.query.filter_by(email=email).first()
+        user_role = user.role.name
+        response = {
+            "access_token": "Bearer "
+            + create_access_token(
+                identity=email,
+                additional_claims={"role": user_role, "tokenType": "access"},
             ),
-            "refresh_token": create_refresh_token(
-                identity=identity, additional_claims=claims
+            "refresh_token": "Bearer "
+            + create_refresh_token(
+                identity=email,
+                additional_claims={"role": user_role, "tokenType": "refresh"},
             ),
             "role": user_role,
+            "id": user.id,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "parent_name": user.parent_name,
+            "email": user.email,
+            "phone": user.phone,
+            "verified": user.email_confirmed,
         }
+
+        if user_role == Roles.TEACHER:
+            teacher = Teacher.query.filter_by(email=email).first()
+            response["id"] = teacher.id
+            response["verified"] = teacher.verified
+        elif user_role == Roles.SPECIALIST:
+            expert = Specialist.query.filter_by(email=email).first()
+            response["id"] = expert.id
+            response["verified"] = expert.verified
+
+        return response
 
 
 @user_ns.route("/change-password")
@@ -273,3 +490,71 @@ class ChangePassword(Resource):
         user.password_hash = generate_password_hash(new_password)
         db.session.commit()
         return {"message": "Password changed"}, 200
+
+
+@user_ns.route("/verify-request-on-mail")
+class VerifyRequestOnMail(Resource):
+    @user_ns.doc(
+        security="jsonWebToken",
+        description="Verify request on mail",
+        responses={
+            200: "Request for verification was successfully sent to the administrator's email",
+            404: "User with email '{email}' does not exist",
+        },
+    )
+    @jwt_required()
+    def post(self):
+        """send request for verification to the administrator's email"""
+        email = get_jwt_identity()
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            abort(404, f"User with email '{email}' does not exist")
+
+        subject = "Education UA - Request for verification"
+        body = render_template("verify_request.html", user=user)
+        admin_email = current_app.config["MAIL_USERNAME"]
+
+        SecurityUtils.send_mail(
+            subject=subject, template=body, recipients=[admin_email]
+        )
+
+        return {
+            "message": f"Request for verification was successfully sent to the administrator's email {admin_email}"
+        }, 200
+
+
+@user_ns.route("/teacher-register-request-on-mail")
+class TeacherRegisterRequestOnMail(Resource):
+
+    @user_ns.doc(
+        description="Teacher register request on mail",
+        responses={
+            200: "Request for registration was successfully sent to the administrator's email"
+        },
+    )
+    @user_ns.expect(teacher_register_request_model)
+    def post(self):
+        """send request for teacher registration to the administrator's email"""
+
+        admin_email = current_app.config["MAIL_USERNAME"]
+        teacher_email = user_ns.payload.get("email")
+
+        SecurityUtils.send_mail(
+            subject="Education UA - Request for teacher registration",
+            template=render_template(
+                "teacher_register_request_for_admin.html", data=user_ns.payload
+            ),
+            recipients=[admin_email],
+        )
+
+        SecurityUtils.send_mail(
+            subject="Education UA - Request for teacher registration",
+            template=render_template(
+                "teacher_register_request_for_teacher.html", data=user_ns.payload
+            ),
+            recipients=[teacher_email],
+        )
+
+        return {
+            "message": f"Request for registration was successfully sent to the administrator's email {admin_email}"
+        }, 200

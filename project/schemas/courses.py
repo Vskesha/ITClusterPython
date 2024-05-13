@@ -1,10 +1,8 @@
-from flask_restx import fields, reqparse
+from flask_restx import fields
 
 from project.extensions import api
 from project.schemas.disciplines import short_discipline_model
 from project.schemas.syllabus import base_syllabus_model
-from project.schemas.teachers import teacher_short_model
-
 
 base_course_model = api.model(
     "BaseCourse",
@@ -17,7 +15,7 @@ base_course_model = api.model(
 course_model = api.model(
     "Course",
     {
-        "id": fields.Integer(
+        "teacher_id": fields.Integer(
             readonly=True,
             description="Unique identifier of the teacher",
             default=1
@@ -25,15 +23,3 @@ course_model = api.model(
         **base_course_model
     }
 )
-
-course_with_name_model = api.model(
-    "CourseWithName",
-    {
-        **teacher_short_model,
-        **base_course_model
-    }
-)
-
-
-teacher_id_parser = reqparse.RequestParser()
-teacher_id_parser.add_argument("teacher_id", type=int, required=False)
